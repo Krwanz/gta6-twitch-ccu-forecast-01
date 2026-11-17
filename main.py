@@ -5,18 +5,24 @@ writes, for each of hours 2..24 of the release day, five quantiles (5%, 25%, 50%
 95%) of that hour's Twitch category viewer count, as JSON {"hours": [{"hour": h, "q":
 [q05, q25, q50, q75, q95]}, ...]} to the output directory.
 
-Model: a rolling-midnight launch curve, calibrated on the case's own comparables.
-For every comparable launch whose unlock rolled at midnight local time (the same
-kind of launch GTA VI is), take the ratio of each hour's viewers to that launch's
-hour-1 viewers, in log space. The forecast's median for hour h is the hour-1 print
-times the median log-ratio for h across those comparables; the spread around it is
-the house baseline's widening spread, 0.15 * sqrt(h - 1) in log space, so the five
-quantiles are median * exp(z_tau * 0.15 * sqrt(h - 1)) with z the standard normal
-quantiles. Rolling-midnight launches share one shape: a dip in the small hours, a
-rise as the Americas unlock, an evening peak, an overnight decay. Launches that
-unlocked simultaneously worldwide, or with early access, follow different shapes
-and are left out of the pool; the GTA VI pre-release curve is not a launch and is
-left out too.
+Model: a rolling-midnight launch curve, calibrated on the case's own comparables,
+with two corrections the comparables themselves support. For every comparable
+launch whose unlock rolled at midnight local time (the same kind of launch GTA VI
+is), take the ratio of each hour's viewers to that launch's hour-1 viewers, in
+log space. The forecast's median for hour h is the hour-1 print times the median
+log-ratio for h across those comparables, shifted by how big this launch's hour 1
+is next to the pool's: shift = -0.25 * (ln(p1) - ln(pool median hour 1)). Big
+hour-1 launches (front-loaded: much of the audience was already watching at
+midnight, leaks or hype) rise less later; small hour-1 launches surge more.
+The spread around the median is the house baseline's widening spread,
+0.15 * sqrt(h - 1) in log space, widened above the median (x1.3) and narrowed
+below it (x0.8): launch curves are right-skewed, upward surges run further than
+downward ones, so the five quantiles are median * exp(z_tau * spread_tau) with
+z the standard normal quantiles. Rolling-midnight launches share one shape: a
+dip in the small hours, a rise as the Americas unlock, an evening peak, an
+overnight decay. Launches that unlocked simultaneously worldwide, or with early
+access, follow different shapes and are left out of the pool; the GTA VI
+pre-release curve is not a launch and is left out too.
 
 Python 3.13, standard library only. Deterministic: no randomness, no wall clock,
 no network; the same case always writes the same bytes. Runs in well under a
@@ -48,6 +54,14 @@ Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 # The spread of an hour's move, in natural-log units per square-root hour
 # (the house baseline's spread; the median below is what this entry improves).
 SIGMA = 0.15
+# The hour-1 size correction (see median_log_ratios): how much the median
+# log-ratio curve flattens per log unit this launch's hour 1 sits above the
+# pool's median hour 1. Negative: a bigger hour 1 means a flatter day.
+BETA = -0.25
+# The spread is asymmetric: launch curves are right-skewed, so the quantiles
+# above the median widen and the ones below it narrow, by these factors.
+SPREAD_UP = 1.3
+SPREAD_LO = 0.8
 # A comparable only joins the pool when its hour-1 print is at least this big:
 # a near-empty category's ratios are noise.
 MIN_HOUR1_VIEWERS = 100
@@ -126,10 +140,21 @@ def median(values: list[float]) -> float:
     return (ordered[mid - 1] + ordered[mid]) / 2
 
 
-def median_log_ratios(case: dict) -> dict[int, float]:
+def median_log_ratios(case: dict, p1: float) -> dict[int, float]:
     """Per-hour median log(viewers_h / viewers_1) over the rolling-midnight
-    comparables. An hour with too thin a pool maps to 0.0 (persistence)."""
+    comparables, shifted by this launch's hour-1 size. An hour with too thin
+    a pool maps to 0.0 (persistence, unshifted).
+
+    The size shift is the one structural correction the comparables support:
+    across all 37 of them, a launch's hour-1 size predicts its curve's
+    amplitude — big hour-1 launches (the audience already there at midnight)
+    rise less over the day, small hour-1 launches surge more (leave-one-out
+    correlation -0.3 to -0.6 by hour). The shift is BETA times this launch's
+    log hour-1 minus the pool's median log hour-1, so a typical-size launch
+    is barely moved and the correction grows with how far off-typical it is.
+    """
     per_hour: dict[int, list[float]] = {h: [] for h in range(2, 25)}
+    firsts: list[float] = []
     for comp in case.get("comparables", []):
         if not is_rolling_midnight(comp):
             continue
@@ -137,23 +162,30 @@ def median_log_ratios(case: dict) -> dict[int, float]:
         first = hours.get(1, 0)
         if first < MIN_HOUR1_VIEWERS:
             continue
+        firsts.append(first)
         for hour in range(2, 25):
             viewers = hours.get(hour, 0)
             if viewers > 0:
                 per_hour[hour].append(math.log(viewers / first))
+    shift = 0.0
+    if firsts:
+        shift = BETA * (math.log(max(p1, 1.0)) - math.log(median(firsts)))
     return {
-        hour: (median(ratios) if len(ratios) >= MIN_POOL_PER_HOUR else 0.0)
+        hour: (median(ratios) + shift if len(ratios) >= MIN_POOL_PER_HOUR else 0.0)
         for hour, ratios in per_hour.items()
     }
 
 
 def hour_quantiles(p1: float, hour: int, log_median: float) -> list[float | int]:
     """The five quantiles for one hour: the calibrated median, widened by the
-    baseline's spread."""
+    baseline's spread, asymmetrically — wider above the median, narrower
+    below it, because launch curves are right-skewed (pooled log-ratio
+    deviations from the per-hour median run further up than down)."""
     spread = SIGMA * math.sqrt(hour - 1)
     quantiles = []
     for z in Z:
-        value = p1 * math.exp(log_median + z * spread)
+        factor = SPREAD_UP if z > 0 else SPREAD_LO if z < 0 else 1.0
+        value = p1 * math.exp(log_median + z * factor * spread)
         value = min(max(value, 1.0), 1e9)
         quantiles.append(round2(value))
     # Rounding can only tie neighbours, never invert them, but enforce the
@@ -171,7 +203,7 @@ def forecast_case(case: dict, name: str) -> dict:
     if first is None:
         raise ValueError(f"{name} has no hour-1 print")
     p1 = max(1, first["viewers"])
-    log_medians = median_log_ratios(case)
+    log_medians = median_log_ratios(case, p1)
     return {
         "hours": [
             {

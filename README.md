@@ -14,9 +14,12 @@ forecast for each of hours 2–24 is that count times the shape of a typical
 rolling-midnight console launch: for every comparable launch in the case that
 unlocked at midnight local time (the same kind of launch GTA VI is), take the
 ratio of each hour's viewers to its hour-1 viewers, in log space, and use the
-median ratio for that hour. The spread around the median is the house baseline's
-widening spread, `0.15 * sqrt(h - 1)` in log space, so the five quantiles are
-`median * exp(z_tau * 0.15 * sqrt(h - 1))`.
+median ratio for that hour — shifted by how big this launch's hour 1 is next to
+the pool's median hour 1 (`-0.25 * (ln(p1) - ln(pool median))`): big hour-1
+launches rise less later, small ones surge more. The spread around the median
+is the house baseline's widening spread, `0.15 * sqrt(h - 1)` in log space,
+widened above the median (x1.3) and narrowed below it (x0.8), because launch
+curves are right-skewed.
 
 Rolling-midnight launches share one shape — a dip in the small hours, a rise as
 the Americas unlock, an evening peak, an overnight decay. Launches that unlocked
@@ -27,9 +30,10 @@ left out of the pool.
 
 On 37 past launches treated as pseudo-cases (each scored against its own
 release day, the pool built leave-one-out), the rolling-midnight subset — the
-kind of launch this contest's final is — scores a mean pinball loss of 0.285
-against the house baseline's 0.406 on the same cases, a median of 0.194 against
-0.255. The kit reports the house baseline's practice loss as 0.387, which the
+kind of launch this contest's final is — scores a mean pinball loss of 0.259
+against the house baseline's 0.406 on the same cases, a median of 0.209 against
+0.255, and 7 of 8 beat the baseline. Across all 37 the mean is 0.690 against
+0.930. The kit reports the house baseline's practice loss as 0.387, which the
 pseudo-evaluation reproduces closely on the rolling subset (0.406), so the
 improvement should carry to the practice set. The final is one case, so the
 practice margin is an estimate, not a guarantee.
