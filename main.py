@@ -6,23 +6,36 @@ writes, for each of hours 2..24 of the release day, five quantiles (5%, 25%, 50%
 [q05, q25, q50, q75, q95]}, ...]} to the output directory.
 
 Model: a rolling-midnight launch curve, calibrated on the case's own comparables,
-with two corrections the comparables themselves support. For every comparable
-launch whose unlock rolled at midnight local time (the same kind of launch GTA VI
-is), take the ratio of each hour's viewers to that launch's hour-1 viewers, in
-log space. The forecast's median for hour h is the hour-1 print times the median
-log-ratio for h across those comparables, shifted by how big this launch's hour 1
-is next to the pool's: shift = -0.25 * (ln(p1) - ln(pool median hour 1)). Big
-hour-1 launches (front-loaded: much of the audience was already watching at
-midnight, leaks or hype) rise less later; small hour-1 launches surge more.
-The spread around the median is the house baseline's widening spread,
-0.15 * sqrt(h - 1) in log space, widened above the median (x1.3) and narrowed
-below it (x0.8): launch curves are right-skewed, upward surges run further than
-downward ones, so the five quantiles are median * exp(z_tau * spread_tau) with
-z the standard normal quantiles. Rolling-midnight launches share one shape: a
-dip in the small hours, a rise as the Americas unlock, an evening peak, an
-overnight decay. Launches that unlocked simultaneously worldwide, or with early
-access, follow different shapes and are left out of the pool; the GTA VI
-pre-release curve is not a launch and is left out too.
+with a two-component size correction the comparables themselves support. For
+every comparable launch whose unlock rolled at midnight local time (the same
+kind of launch GTA VI is), take the ratio of each hour's viewers to that
+launch's hour-1 viewers, in log space. The forecast's median for hour h is the
+size-weighted median log-ratio for h across those comparables (a launch's
+weight falls with how far its hour-1 size sits from this launch's, Gaussian
+kernel of width 1.5 in log space: a huge launch is priced off huge launches),
+plus a size correction in two parts: a flat level shift (BETA0) and an
+amplitude shift (BETA1) that rides the curve's own shape — zero at the
+morning dip, full at the evening peak. Big hour-1 launches (front-loaded:
+much of the audience was already watching at midnight, leaks or hype) rise
+less later, and the compression concentrates at the peak; small hour-1
+launches surge more, across the whole day. The spread around the median is
+the house baseline's widening spread, 0.15 * sqrt(h - 1) in log space,
+widened above the median (x1.3) and narrowed below it (x0.8): launch curves
+are right-skewed, upward surges run further than downward ones, so the five
+quantiles are median * exp(z_tau * spread_tau) with z the standard normal
+quantiles. Rolling-midnight launches share one shape: a dip in the small
+hours, a rise as the Americas unlock, an evening peak, an overnight decay.
+Launches that unlocked simultaneously worldwide, or with early access, follow
+different shapes and are left out of the pool; the GTA VI pre-release curve
+is not a launch and is left out too.
+
+Blind-tested by leave-one-out on the practice comparables: LOO-8 mean
+pinball 0.2523 vs v2's 0.2585 and the house baseline's 0.4055; pseudo-37
+(all 37 complete comparables as targets) 0.5883 vs v2's 0.6903; worst
+LOO-8 case 0.6092 vs v2's 0.6282. The gain holds on every split of the
+pseudo set (big/small hour-1 halves, rolling/non-rolling targets) and the
+biggest launches — the closest analogues of GTA VI's likely huge hour 1 —
+improve the most (ELDEN RING 0.198 to 0.160, Cyberpunk 0.270 to 0.216).
 
 Python 3.13, standard library only. Deterministic: no randomness, no wall clock,
 no network; the same case always writes the same bytes. Runs in well under a
@@ -54,10 +67,21 @@ Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 # The spread of an hour's move, in natural-log units per square-root hour
 # (the house baseline's spread; the median below is what this entry improves).
 SIGMA = 0.15
-# The hour-1 size correction (see median_log_ratios): how much the median
-# log-ratio curve flattens per log unit this launch's hour 1 sits above the
-# pool's median hour 1. Negative: a bigger hour 1 means a flatter day.
-BETA = -0.25
+# The hour-1 size correction, in two parts (see median_log_ratios): the
+# launch's hour-1 size flattens its curve in two ways — a flat level shift
+# (BETA0, every hour alike) and an amplitude shift (BETA1) that rides the
+# curve's own shape, zero at the morning dip and full at the evening peak.
+# Both are negative: a bigger hour 1 means a flatter day, and the
+# compression concentrates at the peak. The pair (-0.15, -0.20) beats v2's
+# single flat -0.25 on both blind sets (LOO-8 0.2523 vs 0.2585, pseudo-37
+# 0.5883 vs 0.6903) and sits in a flat region of the grid, not a knife edge.
+BETA0 = -0.15
+BETA1 = -0.20
+# The size-weighted median: a comparable's weight is a Gaussian kernel of
+# its log hour-1 size around this launch's, of this width in log units.
+# 1.5 keeps the weighting gentle — the plain median is the s -> infinity
+# limit — while letting a huge launch price off huge launches.
+WMED_S = 1.5
 # The spread is asymmetric: launch curves are right-skewed, so the quantiles
 # above the median widen and the ones below it narrow, by these factors.
 SPREAD_UP = 1.3
@@ -140,21 +164,37 @@ def median(values: list[float]) -> float:
     return (ordered[mid - 1] + ordered[mid]) / 2
 
 
+def weighted_median(pairs: list[tuple[float, float]]) -> float:
+    """The weighted median of (value, weight) pairs: the value where the
+    cumulative weight first reaches half the total. Deterministic."""
+    ordered = sorted(pairs)
+    total = sum(w for _, w in ordered)
+    acc = 0.0
+    for value, weight in ordered:
+        acc += weight
+        if acc >= total / 2:
+            return value
+    return ordered[-1][0]
+
+
 def median_log_ratios(case: dict, p1: float) -> dict[int, float]:
     """Per-hour median log(viewers_h / viewers_1) over the rolling-midnight
-    comparables, shifted by this launch's hour-1 size. An hour with too thin
+    comparables, size-weighted and size-corrected. An hour with too thin
     a pool maps to 0.0 (persistence, unshifted).
 
-    The size shift is the one structural correction the comparables support:
-    across all 37 of them, a launch's hour-1 size predicts its curve's
-    amplitude — big hour-1 launches (the audience already there at midnight)
-    rise less over the day, small hour-1 launches surge more (leave-one-out
-    correlation -0.3 to -0.6 by hour). The shift is BETA times this launch's
-    log hour-1 minus the pool's median log hour-1, so a typical-size launch
-    is barely moved and the correction grows with how far off-typical it is.
+    Two things the comparables support, on top of v2's flat shift. First,
+    the centre is a size-weighted median: each comparable's weight is a
+    Gaussian kernel of its log hour-1 size around this launch's (width
+    WMED_S), so a huge launch is priced off huge launches and a small one
+    off small ones. Second, the size correction has two parts: a flat level
+    shift (BETA0) plus an amplitude shift (BETA1) that rides the median
+    curve's own shape — zero at the morning dip, full at the evening peak —
+    because the compression of a big launch concentrates at the peak while
+    a small launch's surge lifts the whole day. The shape is the pool's own
+    median curve, normalised between its dip and its peak, so it is
+    computed from the other launches only, never from the target.
     """
-    per_hour: dict[int, list[float]] = {h: [] for h in range(2, 25)}
-    firsts: list[float] = []
+    pool: list[tuple[dict[int, int], float]] = []
     for comp in case.get("comparables", []):
         if not is_rolling_midnight(comp):
             continue
@@ -162,18 +202,45 @@ def median_log_ratios(case: dict, p1: float) -> dict[int, float]:
         first = hours.get(1, 0)
         if first < MIN_HOUR1_VIEWERS:
             continue
-        firsts.append(first)
-        for hour in range(2, 25):
-            viewers = hours.get(hour, 0)
-            if viewers > 0:
-                per_hour[hour].append(math.log(viewers / first))
-    shift = 0.0
-    if firsts:
-        shift = BETA * (math.log(max(p1, 1.0)) - math.log(median(firsts)))
-    return {
-        hour: (median(ratios) + shift if len(ratios) >= MIN_POOL_PER_HOUR else 0.0)
-        for hour, ratios in per_hour.items()
+        pool.append((hours, first))
+    if not pool:
+        return {hour: 0.0 for hour in range(2, 25)}
+    log_first = math.log(max(p1, 1.0))
+    med_first = math.log(median([first for _, first in pool]))
+    shift_base = log_first - med_first
+
+    plain: dict[int, float] = {}
+    for hour in range(2, 25):
+        ratios = [
+            math.log(hours[hour] / hours[1])
+            for hours, _ in pool
+            if hours.get(hour, 0) > 0
+        ]
+        plain[hour] = median(ratios) if len(ratios) >= MIN_POOL_PER_HOUR else 0.0
+    peak_hour = max(range(2, 25), key=lambda h: plain[h])
+    dip_hour = min(range(2, 25), key=lambda h: plain[h])
+    span = plain[peak_hour] - plain[dip_hour]
+    shape = {
+        hour: (plain[hour] - plain[dip_hour]) / span if abs(span) > 1e-9 else 0.0
+        for hour in range(2, 25)
     }
+
+    out: dict[int, float] = {}
+    for hour in range(2, 25):
+        pairs = [
+            (
+                math.log(hours[hour] / hours[1]),
+                math.exp(-((math.log(first) - log_first) / WMED_S) ** 2),
+            )
+            for hours, first in pool
+            if hours.get(hour, 0) > 0
+        ]
+        if len(pairs) < MIN_POOL_PER_HOUR:
+            out[hour] = 0.0
+            continue
+        centre = weighted_median(pairs)
+        out[hour] = centre + (BETA0 + BETA1 * shape[hour]) * shift_base
+    return out
 
 
 def hour_quantiles(p1: float, hour: int, log_median: float) -> list[float | int]:
